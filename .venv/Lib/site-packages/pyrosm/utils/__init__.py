@@ -1,0 +1,649 @@
+import numbers
+
+import numpy as np
+import shapely
+from shapely import ops
+from shapely.geometry import (
+    LinearRing,
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Polygon,
+    box,
+)
+from pyrosm.exceptions import PBFNotImplemented
+import functools
+import inspect
+import os
+from pathlib import Path
+import geopandas as gpd
+import pandas as pd
+import contextlib
+import contextvars
+import sys
+import threading
+import warnings
+
+# A filter key ``id`` is refused: ``id`` is the element's OSM id, and a tag keyed ``id`` is
+# filtered, like its column, as ``id_tag``.
+_ID_FILTER_KEY_ERROR = (
+    "'id' is the element's OSM id, not a tag key; a tag keyed 'id' is filtered as "
+    "'id_tag', the column pyrosm returns it in."
+)
+
+
+def validate_custom_filter(custom_filter):
+    """``custom_filter`` checked and in the form the readers take: an advanced form (a
+    bracket-filter string, a list of them, or a dict with compiled regex values) compiled
+    into a ``CompiledFilter``, a plain dict copied with ``True`` values as ``[True]``.
+    Raises ``ValueError`` for a malformed filter or one keyed ``id``."""
+    from pyrosm.filter_compiler import compile_custom_filter, is_advanced_filter
+
+    if is_advanced_filter(custom_filter):
+        compiled = compile_custom_filter(custom_filter)
+        if "id" in compiled.keys():
+            raise ValueError(_ID_FILTER_KEY_ERROR)
+        return compiled
+
+    # Check that the custom filter is in correct format
+    if not isinstance(custom_filter, dict):
+        raise ValueError(
+            f"'custom_filter' should be a Python dictionary. "
+            f"Got {custom_filter} with type {type(custom_filter)}."
+        )
+
+    # Normalize a copy, so the caller's dict stays as given.
+    custom_filter = dict(custom_filter)
+    for k, v in custom_filter.items():
+        if not isinstance(k, str):
+            raise ValueError(
+                f"OSM key in 'custom_filter' should be string. "
+                f"Got {k} of type {type(k)}"
+            )
+        if k == "id":
+            raise ValueError(_ID_FILTER_KEY_ERROR)
+        if v is True:
+            custom_filter[k] = [v]
+            continue
+
+        if not isinstance(v, list):
+            raise ValueError(
+                f"OSM tags in 'custom_filter' should be inside a list. "
+                f"Got {v} of type {type(v)}"
+            )
+
+        for item in v:
+            if item is True:
+                continue
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"OSM tag (value) in 'custom_filter' should be string. "
+                    f"Got {item} of type {type(item)}"
+                )
+    return custom_filter
+
+
+def require_layer_key(custom_filter, key, values=True):
+    """``custom_filter`` narrowed to one layer: every OR-group of the filter without a
+    positive condition on ``key`` also requires ``key`` to exist (``values=True``) or to have
+    one of ``values``, so each element kept belongs to the layer; a group with one keeps its
+    own values of ``key``. A dict that tests only ``key`` is returned as it is; another dict
+    becomes a ``CompiledFilter`` (see :meth:`CompiledFilter.and_require`). Never mutates the
+    input."""
+    from pyrosm.filter_compiler import CompiledFilter, _dict_to_groups
+
+    if isinstance(custom_filter, dict):
+        if not custom_filter:
+            return {key: [True] if values is True else list(values)}
+        if all(k == key for k in custom_filter):
+            return custom_filter
+        custom_filter = CompiledFilter(_dict_to_groups(custom_filter))
+    return custom_filter.and_require(key, values)
+
+
+def set_frame_attr(result, key, value):
+    """Set ``attrs[key]`` to ``value`` on the frame(s) of a read's ``result`` (a frame or a
+    tuple of frames); entries that are not frames (an empty read's ``None``) are left alone.
+    Returns ``result``."""
+    frames = result if isinstance(result, tuple) else (result,)
+    for frame in frames:
+        if isinstance(frame, pd.DataFrame):
+            frame.attrs[key] = value
+    return result
+
+
+def records_read(read_filter):
+    """Decorate an ``OSM`` reader so that the frame(s) it returns note, in
+    ``attrs["pyrosm_read"]``, the reader's name and the filter it selected their elements
+    by, as JSON (see :meth:`pyrosm.filter_compiler.CompiledFilter.to_json`). ``write_pbf``
+    uses the note to warn when written elements would no longer match. ``read_filter`` gets
+    the call's arguments by name and returns that filter, or ``None`` to note nothing. The
+    nodes of a ``(nodes, edges)`` pair note an empty filter: they are in the result for the
+    ways that use them, not for tags of their own.
+    """
+    from pyrosm.filter_compiler import as_compiled_filter
+
+    def decorate(method):
+        signature = inspect.signature(method)
+
+        @functools.wraps(method)
+        def wrapper(*args, **kwargs):
+            result = method(*args, **kwargs)
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            selected_by = read_filter(bound.arguments)
+            if selected_by is None:
+                return result
+            note = {
+                "reader": method.__name__,
+                "filter": as_compiled_filter(selected_by).to_json(),
+            }
+            if isinstance(result, tuple):
+                set_frame_attr(result[:-1], "pyrosm_read", dict(note, filter=[]))
+                set_frame_attr(result[-1], "pyrosm_read", note)
+                return result
+            return set_frame_attr(result, "pyrosm_read", note)
+
+        return wrapper
+
+    return decorate
+
+
+def feature_columns(keys, missing=()):
+    """The default tag columns of a read whose filter has the ``keys``: the default
+    columns of each key's feature (``Conf.tags.<key>``), and ``missing`` for a key without
+    them."""
+    from pyrosm.config import Conf
+
+    columns = []
+    for key in keys:
+        defaults = getattr(Conf.tags, key, None)
+        columns += defaults if isinstance(defaults, list) else list(missing)
+    return columns
+
+
+def read_tag_columns(
+    base_tags,
+    extra_attributes=None,
+    tags_to_keep=None,
+    filter_keys=(),
+    tags_name="tags_to_keep",
+):
+    """The tag columns of a read: ``tags_to_keep``, by default ``base_tags``, then the
+    ``filter_keys`` of the read's filter it lacks, so the key each row was selected by is
+    a column, then ``extra_attributes``, and ``visible`` when they lack it, so the
+    element's field is a column of every read and never a key of the JSON ``tags``.
+    Validated (an error names ``tags_to_keep`` by ``tags_name``, the parameter it was
+    given as), and a new list: the caller's lists do not change."""
+    columns = list(base_tags)
+    if tags_to_keep is not None:
+        validate_tags_as_columns(tags_to_keep, tags_name)
+        columns = list(tags_to_keep)
+    columns += [key for key in dict.fromkeys(filter_keys) if key not in columns]
+    if extra_attributes is not None:
+        validate_tags_as_columns(extra_attributes, "extra_attributes")
+        columns += list(extra_attributes)
+    if "visible" not in columns:
+        columns.append("visible")
+    return columns
+
+
+def custom_read_columns(custom_filter, osm_keys_to_keep, tags_as_columns, tags_to_keep):
+    """The tag columns of ``get_data_by_custom_criteria`` before ``extra_attributes`` (see
+    :func:`read_tag_columns`): ``tags_to_keep`` or ``tags_as_columns`` (two names of the same
+    parameter, so giving both raises), by default the feature columns of the filter's keys
+    (the keys themselves when they have none) or, for a read of every element
+    (``custom_filter=None``), those of every known feature; and the keys of the filter and
+    of ``osm_keys_to_keep``."""
+    from pyrosm.config import Conf
+
+    if tags_as_columns is not None and tags_to_keep is not None:
+        raise ValueError(
+            "Give 'tags_to_keep' or 'tags_as_columns', not both: they name the same "
+            "columns."
+        )
+    requested, name = (
+        (tags_to_keep, "tags_to_keep")
+        if tags_to_keep is not None
+        else (tags_as_columns, "tags_as_columns")
+    )
+    if custom_filter is None:
+        return read_tag_columns(
+            Conf.tags._every_feature_columns(), None, requested, tags_name=name
+        )
+    keys = list(custom_filter.keys())
+    keys += (
+        [osm_keys_to_keep]
+        if isinstance(osm_keys_to_keep, str)
+        else osm_keys_to_keep or []
+    )
+    return read_tag_columns(
+        feature_columns(custom_filter.keys()) or keys, None, requested, keys, name
+    )
+
+
+def keys_as_filter(custom_filter, osm_keys_to_keep, filter_type):
+    """``(custom_filter, filter_type)`` of a custom read: as given, or, with only
+    ``osm_keys_to_keep``, a filter keeping every element with one of its keys (there is
+    no value filter to exclude by, so ``filter_type`` is ``"keep"``)."""
+    if custom_filter is not None or osm_keys_to_keep is None:
+        return custom_filter, filter_type
+    keys = [osm_keys_to_keep] if isinstance(osm_keys_to_keep, str) else osm_keys_to_keep
+    return {key: True for key in keys}, "keep"
+
+
+def validate_osm_keys(osm_keys):
+    """Raise ``ValueError`` unless ``osm_keys`` (``osm_keys_to_keep``) is None, a key or a
+    list of keys, without the key ``id``."""
+    if osm_keys is not None:
+        if type(osm_keys) not in [str, list]:
+            raise ValueError(
+                f"'osm_keys_to_keep' -parameter should be of type str or list. "
+                f"Got {osm_keys} of type {type(osm_keys)}."
+            )
+        if "id" in ([osm_keys] if isinstance(osm_keys, str) else osm_keys):
+            raise ValueError(_ID_FILTER_KEY_ERROR)
+
+
+def validate_tags_as_columns(tags_as_columns, name="tags_as_columns"):
+    """Raise ``ValueError``, naming the parameter ``name``, unless ``tags_as_columns`` is
+    a list of strings."""
+    if not isinstance(tags_as_columns, list):
+        raise ValueError(
+            f"'{name}' should be a list. "
+            f"Got {tags_as_columns} of type {type(tags_as_columns)}."
+        )
+    for col in tags_as_columns:
+        if not isinstance(col, str):
+            raise ValueError(
+                f"All tags listed in '{name}' should be strings. "
+                f"Got {col} of type {type(col)}."
+            )
+
+
+def validate_bool(value, name):
+    """Raise ``ValueError`` unless ``value``, the parameter ``name``, is True or False."""
+    if not isinstance(value, bool):
+        raise ValueError(f"'{name}' should be boolean type: True or False")
+
+
+def validate_booleans(keep_nodes, keep_ways, keep_relations):
+    """Raise ``ValueError`` unless the three parameters are booleans and one of them is
+    True."""
+    validate_bool(keep_nodes, "keep_nodes")
+    validate_bool(keep_ways, "keep_ways")
+    validate_bool(keep_relations, "keep_relations")
+
+    if keep_nodes is False and keep_ways is False and keep_relations is False:
+        raise ValueError(
+            "At least on of the following parameters should be True: "
+            "'keep_nodes', 'keep_ways', or 'keep_relations'"
+        )
+
+
+def validate_boundary_type(boundary_type):
+    allowed_boundary_types = [
+        "administrative",
+        "national_park",
+        "political",
+        "postal_code",
+        "protected_area",
+        "aboriginal_lands",
+        "maritime",
+        "marker",
+        # There is no consensus whether allowing the following ones should be done
+        # but as they exist, allow using them here as well.
+        # https://wiki.openstreetmap.org/wiki/Parcel
+        "lot",
+        "parcel",
+        "tract",
+        "all",
+    ]
+    allowed_text = ", ".join(allowed_boundary_types)
+    if not isinstance(boundary_type, str):
+        raise ValueError(
+            f"'boundary_type' should be one of the following: {allowed_text}."
+            f"Got '{boundary_type}' of type {type(boundary_type)}."
+        )
+
+    boundary_type = boundary_type.strip().lower()
+    if boundary_type not in allowed_boundary_types:
+        raise ValueError(
+            f"'boundary_type' should be one of the following: {allowed_text}."
+            f"Got '{boundary_type}' of type {type(boundary_type)}."
+        )
+    return boundary_type
+
+
+_BOX_FORMS = (
+    "four numbers [minx, miny, maxx, maxy] (a list, tuple or array, such as a "
+    "GeoDataFrame's total_bounds), a Shapely Polygon or MultiPolygon, or a GeoDataFrame "
+    "or GeoSeries"
+)
+
+
+def check_bounds(bounds, name="bounding_box"):
+    """Refuse the ``(minx, miny, maxx, maxy)`` of the argument ``name`` with
+    ``ValueError`` when they are not finite, lie outside lon/lat or leave no width or no
+    height."""
+    minx, miny, maxx, maxy = bounds
+    if not np.isfinite(bounds).all():
+        raise ValueError("%s must have finite coordinates; got %s." % (name, bounds))
+    if minx > maxx or miny > maxy:
+        raise ValueError(
+            "Invalid %s %s: expected [minx, miny, maxx, maxy] with minx < maxx and "
+            "miny < maxy. Please double-check the order of the coordinates (they may be "
+            "swapped/inverted)." % (name, list(bounds))
+        )
+    if minx == maxx or miny == maxy:
+        raise ValueError(
+            "%s must have a width and a height: expected [minx, miny, maxx, maxy] with "
+            "minx < maxx and miny < maxy; got %s." % (name, list(bounds))
+        )
+    if not (-180 <= minx and maxx <= 180 and -90 <= miny and maxy <= 90):
+        raise ValueError(
+            "%s %s lies outside the lon/lat range; its coordinates must be longitudes "
+            "and latitudes (EPSG:4326)." % (name, list(bounds))
+        )
+
+
+def validate_bounding_box(bounding_box, name="bounding_box"):
+    """``bounding_box`` as pyrosm reads by it, in lon/lat: the list ``[minx, miny, maxx,
+    maxy]`` for four numbers (a list, tuple or array, such as a GeoDataFrame's
+    ``total_bounds``), else a Polygon or MultiPolygon: a Shapely Polygon or MultiPolygon
+    as it is, a closed LineString, LinearRing or MultiLineString made a Polygon, the
+    geometries of a GeoDataFrame or GeoSeries united, in lon/lat. Raises ``ValueError``
+    for any other value and for bounds :func:`check_bounds` refuses; ``name`` names the
+    argument in the messages."""
+    if isinstance(bounding_box, (gpd.GeoDataFrame, gpd.GeoSeries)):
+        if bounding_box.crs is not None:
+            bounding_box = bounding_box.to_crs("EPSG:4326")
+        bounding_box = shapely.union_all(bounding_box.geometry.values)
+    if isinstance(bounding_box, (list, tuple, np.ndarray)):
+        values = list(np.asarray(bounding_box, dtype=object).ravel())
+        if len(values) != 4 or not all(
+            isinstance(v, numbers.Real) and not isinstance(v, bool) for v in values
+        ):
+            raise ValueError(
+                "%s should be %s; got %r." % (name, _BOX_FORMS, bounding_box)
+            )
+        bounds = [float(v) for v in values]
+        check_bounds(bounds, name)
+        return bounds
+    if isinstance(bounding_box, MultiLineString):
+        bounding_box = ops.linemerge(bounding_box)
+    if isinstance(bounding_box, (LineString, LinearRing)):
+        if not bounding_box.is_closed:
+            raise ValueError(
+                "%s is not a closed geometry. Ensure that you pass a Polygon or "
+                "LinearRing." % name
+            )
+        bounding_box = Polygon(bounding_box)
+    if not isinstance(bounding_box, (Polygon, MultiPolygon)) or bounding_box.is_empty:
+        raise ValueError(
+            "%s should be %s; got %r." % (name, _BOX_FORMS, type(bounding_box).__name__)
+        )
+    check_bounds(bounding_box.bounds, name)
+    return bounding_box
+
+
+def validate_input_file(filepath):
+    if isinstance(filepath, os.PathLike):
+        filepath = os.fspath(filepath)
+    if not isinstance(filepath, str):
+        raise ValueError("'filepath' should be a string or os.PathLike object.")
+    if not filepath.endswith(".pbf"):
+        raise ValueError(
+            f"Input data should be in Protobuf format (*.osm.pbf). "
+            f"Found: {filepath.split('.')[-1]}"
+        )
+    if not Path(filepath).exists():
+        raise ValueError(f"File does not exist: " f"Found: {filepath}")
+    return filepath
+
+
+def validate_graph_type(graph_type):
+    if not isinstance(graph_type, str):
+        raise ValueError("'graph_type' should be a string.")
+    graph_type = graph_type.lower()
+    if graph_type not in ["networkx", "igraph", "pandana", "pandarm"]:
+        raise ValueError(
+            f"'graph_type' should be 'networkx', 'igraph', 'pandana', or 'pandarm'. "
+            f"Got '{graph_type}'."
+        )
+    return graph_type
+
+
+def validate_engine(engine):
+    if engine not in ("in_memory", "out_of_core"):
+        raise ValueError("'engine' should be either 'in_memory' or 'out_of_core'.")
+    return engine
+
+
+def _stacklevel_outside_pyrosm():
+    """The ``stacklevel`` with which the function that calls this one makes a warning point
+    at the first caller outside pyrosm: the user's code."""
+    frame = sys._getframe(1)
+    level = 1
+    while frame is not None and frame.f_globals.get("__name__", "").split(".")[0] == (
+        "pyrosm"
+    ):
+        frame = frame.f_back
+        level += 1
+    return level
+
+
+def warn_future(message):
+    """Warn with ``message`` as a ``FutureWarning``, pointing at the user's call."""
+    warnings.warn(message, FutureWarning, stacklevel=_stacklevel_outside_pyrosm())
+
+
+# The messages ``warn_future_once`` has shown in this process.
+_future_warnings_shown = set()
+_future_warnings_lock = threading.Lock()
+
+
+def warn_future_once(message):
+    """``warn_future(message)`` the first time in a process; a warning turned into an error
+    raises at every call."""
+    with _future_warnings_lock:
+        if message not in _future_warnings_shown:
+            warn_future(message)
+            _future_warnings_shown.add(message)
+
+
+def _file_identity(file):
+    """A file's device, inode, size and modification time, to notice it changing:
+    ``file`` an open file (of what it opened) or a path."""
+    st = os.fstat(file.fileno()) if hasattr(file, "fileno") else os.stat(file)
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def default_workers(workers):
+    """``workers``, or when it is not given (None) ``"auto"`` on threads and 1 with the
+    deprecated ``PYROSM_DECODE_BACKEND=processes``."""
+    if workers is not None:
+        return workers
+    from pyrosm.engine.pool import _decode_backend
+
+    return "auto" if _decode_backend() == "threads" else 1
+
+
+def validate_workers(workers):
+    """``workers`` as the readers, crops, merges and downloads take it: None, ``"auto"``
+    (in any case) or an integer of at least 1 (a NumPy integer too, returned as ``int``).
+    Raises ``ValueError`` for any other value."""
+    if workers is None:
+        return None
+    if isinstance(workers, str) and workers.lower() == "auto":
+        return "auto"
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, numbers.Integral)
+        or workers < 1
+    ):
+        raise ValueError(
+            f"'workers' should be a positive integer, 'auto', or None; got {workers!r}."
+        )
+    return int(workers)
+
+
+def validate_node_gdf(nodes):
+    if not isinstance(nodes, gpd.GeoDataFrame):
+        raise ValueError(f"'nodes' should be a GeoDataFrame, got '{type(nodes)}'.")
+    geom_types = nodes.geometry.geom_type.unique().tolist()
+    if len(geom_types) != 1 or geom_types[0] != "Point":
+        raise ValueError("'nodes' should contain only 'Point' geometries.")
+
+
+def validate_edge_gdf(edges):
+    if not isinstance(edges, gpd.GeoDataFrame):
+        raise ValueError(f"'edges' should be a GeoDataFrame, got '{type(edges)}'.")
+    geom_types = edges.geometry.geom_type.unique().tolist()
+    for gtype in geom_types:
+        if gtype not in ["LineString", "MultiLineString"]:
+            raise ValueError(
+                "'edges' should contain only 'LineString' or 'MultiLineString' geometries."
+            )
+
+
+def valid_header_block(header_block, filepath=None):
+    for feature in header_block.required_features:
+        if not (feature in ("OsmSchema-V0.6", "DenseNodes", "HistoricalInformation")):
+            source = f"'{filepath}'" if filepath is not None else "The PBF file"
+            raise PBFNotImplemented(
+                f"{source} requires the PBF feature '{feature}', which pyrosm does "
+                "not support."
+            )
+    return True
+
+
+def get_bounding_box(filepath):
+    from pyrosm.pbf_export import read_header_block
+
+    header_block = read_header_block(filepath)
+    # Validate required features (raises PBFNotImplemented on unknown ones).
+    valid_header_block(header_block, filepath)
+
+    # Parse the optional data bounding box (in nano-degrees).
+    if not header_block.HasField("bbox"):
+        return None
+    bb = header_block.bbox
+    div = 1000000000
+    return box(
+        bb.left / div,
+        bb.bottom / div,
+        bb.right / div,
+        bb.top / div,
+    )
+
+
+def datetime_to_unix_time(dt):
+    return (dt - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta("1s")
+
+
+def unix_time_to_datetime(unix_time):
+    """Convert a UNIX timestamp to a tz-aware UTC ``pd.Timestamp``.
+
+    ``Timestamp.utcfromtimestamp`` is deprecated; ``fromtimestamp`` with
+    ``tz="UTC"`` returns the same tz-aware UTC timestamp that downstream
+    ``datetime_to_unix_time`` (which subtracts a tz-aware epoch) expects.
+    """
+    return pd.Timestamp.fromtimestamp(unix_time, tz="UTC")
+
+
+def get_unix_time(timestamp, osh_file):
+    """``timestamp`` (a UNIX time in seconds, or anything ``pd.to_datetime`` parses, read as
+    UTC) as a UNIX time in seconds, for selecting versions from a history file.
+
+    Raises ``ValueError`` when ``osh_file`` is false, or when the time is in the future or
+    before the first OSM changeset (2005-04-09 19:54:13 UTC).
+    """
+    if not osh_file:
+        raise ValueError(
+            "The input file does not seem to be OSH.PBF -file. "
+            "Timestamp can only be used with OSH.PBF files. "
+            "You can download OSH.PBF files from Geofabrik (requires OSM account): "
+            "https://osm-internal.download.geofabrik.de/"
+        )
+
+    if not isinstance(timestamp, int):
+        dt = pd.to_datetime(timestamp, utc=True)
+        unix_time = datetime_to_unix_time(dt)
+    else:
+        # If integer is provided test that it can be parsed to datetime
+        unix_time = datetime_to_unix_time(unix_time_to_datetime(timestamp))
+
+    # If the time is in the future raise exception
+    if unix_time > datetime_to_unix_time(pd.Timestamp.now("UTC")):
+        raise ValueError(f"timestamp cannot be in the future. Got: {timestamp}.")
+
+    # If the time is older than the first changeset in OSM (2005-04-09 19:54:13), raise exception
+    first_changeset = "2005-04-09 19:54:13"
+    if unix_time < datetime_to_unix_time(pd.to_datetime(first_changeset, utc=True)):
+        raise ValueError(
+            f"The first changeset to OSM was made in '{first_changeset}' by Steve. "
+            f"You attempt to extract older data which won't work."
+        )
+    return unix_time
+
+
+def warn_about_timestamp_not_set(unix_time):
+    """Warn, at the user's call, that a history file is read at the current UTC time
+    ``unix_time`` because no timestamp was given."""
+    warnings.warn(
+        f"Reading OSH.PBF file without user-defined timestamp. Using the current UTC"
+        f" time as timestamp: {unix_time_to_datetime(unix_time)}",
+        UserWarning,
+        stacklevel=_stacklevel_outside_pyrosm(),
+    )
+
+
+# The warning a feature read gives when it finds nothing, by feature.
+_EMPTY_RESULT_MESSAGES = {
+    "boundaries": "Could not find any boundaries for given area.",
+    "buildings": "Could not find any building elements for given area.",
+    "landuse": "Could not find any landuse elements for given area.",
+    "natural": "Could not find any natural elements for given area.",
+    "network": "Could not find any edges for given area.",
+    "custom_network": (
+        "Could not find any edges that match custom_filter in given area."
+    ),
+    "pois": "Could not find any POIs for given area.",
+    "custom": "Could not find any OSM data for given area.",
+}
+
+
+# The messages of the warnings of a result build in progress (see recording_warnings).
+_RECORDED_WARNINGS = contextvars.ContextVar("pyrosm_recorded_warnings", default=None)
+
+
+@contextlib.contextmanager
+def recording_warnings():
+    """A list of the messages of the warnings that :func:`warn_recorded` gives in this
+    context inside the block, such as those of a result build to be given again when the
+    result is read from the cache."""
+    recorded = []
+    token = _RECORDED_WARNINGS.set(recorded)
+    try:
+        yield recorded
+    finally:
+        _RECORDED_WARNINGS.reset(token)
+
+
+def warn_recorded(message, stacklevel=2):
+    """Give the ``UserWarning`` ``message``, and add it to the list of
+    :func:`recording_warnings` when one records in this context. ``stacklevel`` counts
+    from the caller, as for ``warnings.warn``."""
+    warnings.warn(message, UserWarning, stacklevel=stacklevel + 1)
+    recorded = _RECORDED_WARNINGS.get()
+    if recorded is not None:
+        recorded.append(message)
+
+
+def warn_empty_result(feature, stacklevel=2):
+    """Warn that a read of ``feature`` (a key of ``_EMPTY_RESULT_MESSAGES``) found
+    nothing. ``stacklevel`` counts from the caller, as for ``warnings.warn``."""
+    warnings.warn(
+        _EMPTY_RESULT_MESSAGES[feature], UserWarning, stacklevel=stacklevel + 1
+    )

@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "regions": {
+    "south-fed-district": {
+      "name": "Южный федеральный округ",
+      "geofabrik_id": "south-fed-district",
+      "source_url": "https://download.geofabrik.de/russia/south-fed-district-latest.osm.pbf",
+      "file_name": "south-fed-district.osm.pbf",
+      "status": "ok_official_md5",
+      "etag": "\"12e801e6-65f95e157c882\"",
+      "last_modified": "Fri, 06 Nov 2026 06:39:55 GMT",
+      "expected_size": 317194726,
+      "started_at": "2026-11-06T17:40:02+00:00",
+      "updated_at": "2026-11-06T17:42:46+00:00",
+      "note": null,
+      "size_bytes": 317194726,
+      "sha256": "ca41642197f421447eada31cb90cdf5c7acbf10251031340cce3cc8a8705c403",
+      "md5": "c3a2629cf0b3e63562f345b295f62187",
+      "official_md5": "c3a2629cf0b3e63562f345b295f62187",
+      "local_path": "data/raw/osm/south-fed-district.osm.pbf",
+      "downloaded_at": "2026-11-06T17:42:46+00:00",
+      "source_last_modified": "Fri, 06 Nov 2026 06:39:55 GMT"
+    },
+    "north-caucasus-fed-district": {
+      "name": "Северо-Кавказский федеральный округ",
+      "geofabrik_id": "north-caucasus-fed-district",
+      "source_url": "https://download.geofabrik.de/russia/north-caucasus-fed-district-latest.osm.pbf",
+      "file_name": "north-caucasus-fed-district.osm.pbf",
+      "status": "ok_official_md5",
+      "etag": "\"7b74789-65f9661f96f9d\"",
+      "last_modified": "Fri, 06 Nov 2026 07:15:53 GMT",
+      "expected_size": 129451913,
+      "started_at": "2026-11-06T17:42:46+00:00",
+      "updated_at": "2026-11-06T17:44:03+00:00",
+      "note": null,
+      "size_bytes": 129451913,
+      "sha256": "858b268f633e1be4abc688720bf414adfc09da3e33f0c1491cb68de598c3109a",
+      "md5": "94dc2e47aa2aa79f9299e3dd2a47e6d9",
+      "official_md5": "94dc2e47aa2aa79f9299e3dd2a47e6d9",
+      "local_path": "data/raw/osm/north-caucasus-fed-district.osm.pbf",
+      "downloaded_at": "2026-11-06T17:44:03+00:00",
+      "source_last_modified": "Fri, 06 Nov 2026 07:15:53 GMT"
+    }
+  }
+}

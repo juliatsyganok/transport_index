@@ -1,0 +1,257 @@
+from pyrosm.data_filter cimport filter_array_dict_by_indices_or_mask
+from pyrosm.geometry cimport create_relation_geometry, fix_geometry
+from pyrosm._arrays cimport convert_to_arrays_and_drop_empty, convert_way_records_to_lists
+from shapely import multipolygons, multilinestrings
+from shapely.predicates import is_valid
+import numpy as np
+import geopandas as gpd
+
+
+cpdef list members_to_list(members):
+    """Convert a relation's members (a dict of arrays) into a list of
+    ``{member_id, member_type, member_role}`` dicts, decoding the bytes
+    member_type to str. Stored under the 'members' key of the relation's JSON
+    ``tags`` column rather than as a separate column (it only concerns
+    relations, so a full-length column would be mostly null)."""
+    member_ids = members["member_id"]
+    member_types = members["member_type"]
+    member_roles = members["member_role"]
+    parsed = []
+    for j in range(len(member_ids)):
+        mtype = member_types[j]
+        if isinstance(mtype, bytes):
+            mtype = mtype.decode("utf-8")
+        mrole = member_roles[j]
+        if isinstance(mrole, bytes):
+            mrole = mrole.decode("utf-8")
+        parsed.append(
+            {
+                "member_id": int(member_ids[j]),
+                "member_type": mtype,
+                "member_role": mrole,
+            }
+        )
+    return parsed
+
+cpdef _get_ways_for_relation(member_ids, member_roles, building_relation_ways):
+    return get_ways_for_relation(member_ids, member_roles, building_relation_ways,
+                                 way_id_index(building_relation_ways["id"]))
+
+cdef way_id_index(way_ids):
+    """The relation ways' ids in sorted order, with the rows that sort them."""
+    order = np.argsort(way_ids, kind="stable")
+    return order, np.asarray(way_ids)[order]
+
+cdef get_ways_for_relation(member_ids, member_roles, building_relation_ways, way_index):
+    # Ensure there are no duplicate member_ids/roles
+    member_ids, idx = np.unique(member_ids, return_index=True)
+    member_roles = member_roles[idx]
+
+    # Rows of the member ways, in their order among the relation ways
+    order, sorted_ids = way_index
+    first = np.searchsorted(sorted_ids, member_ids, side="left")
+    last = np.searchsorted(sorted_ids, member_ids, side="right")
+    found = last > first
+    counts = (last - first)[found]
+    positions = np.repeat(first[found] - np.cumsum(counts) + counts, counts)
+    rows = np.sort(order[positions + np.arange(len(positions))])
+
+    # If data for relation is not available, skip
+    if len(rows) == 0:
+        return None, None, None
+
+    # If some of the ways were missing, use the ones that are available.
+    # Might cause incorrectly shaped geometry but it's better than not having
+    # the data for relation at all
+    elif len(member_ids) != len(rows):
+        member_ids = member_ids[found]
+        member_roles = member_roles[found]
+
+    ways = filter_array_dict_by_indices_or_mask(building_relation_ways, rows)
+    return member_ids, member_roles, ways
+
+cdef get_relations(relations, relation_ways, node_coordinates, bint keep_metadata=True):
+    """The relation records of ``relations``; in a threaded read built by vectorized shapely
+    calls over all of them (see ``pyrosm.engine.relation_geometry``)."""
+    from pyrosm.engine.pool import in_threaded_read
+
+    if in_threaded_read():
+        from pyrosm.engine.relation_geometry import relation_records as batched
+
+        return batched(relations, relation_ways, node_coordinates, keep_metadata)
+    return relation_records(relations, relation_ways, node_coordinates, keep_metadata)
+
+
+cpdef tuple relation_kind(dict tag):
+    """``(force_linestring, make_multipolygon)`` of a relation with the tags ``tag``: whether
+    its geometry is a LineString, and whether its type makes it a MultiPolygon."""
+    tag_keys = list(tag.keys())
+    # Check if geometry should NOT be polygon
+    force_linestring = False
+
+    # ==========================================
+    # Determine if relation should be LineString
+    # ==========================================
+    # OSM Relation keys that are typically LineStrings
+    linestring_keys = ["barrier", "route",
+                       "railway", "highway",
+                       "waterway"]
+    for lsk in linestring_keys:
+        if lsk in tag_keys:
+            # Railway
+            # -------
+            if lsk == "railway":
+                # https://wiki.openstreetmap.org/wiki/Key:railway
+                if tag["railway"] not in ["platform", "station", "turntable",
+                                          "roundhouse", "traverser", "wash"]:
+                    force_linestring = True
+                    break
+            # Highway
+            # -------
+            elif lsk == "highway":
+                # https://wiki.openstreetmap.org/wiki/Key:highway
+                if tag["highway"] == "pedestrian":
+                    if "area" in tag_keys:
+                        # If highway is pedestrian area, it should be a Polygon
+                        if tag["area"] != "yes":
+                            force_linestring = True
+                        break
+                elif tag["highway"] not in ["platform", "rest_area", "services"]:
+                    force_linestring = True
+                    break
+            # Waterway
+            # --------
+            elif lsk == "waterway":
+                # https://wiki.openstreetmap.org/wiki/Key:waterway
+                if tag["waterway"] not in ["riverbank", "dock", "boatyard",
+                                           "dam", "fuel"]:
+                    force_linestring = True
+                    break
+            else:
+                force_linestring = True
+                break
+
+    if "area" in tag_keys:
+        if tag["area"] == "no":
+            force_linestring = True
+
+    # A relation explicitly tagged type=multipolygon (or boundary) is an area by
+    # definition; linear member tags (waterway/barrier/...) must not turn it into
+    # a LineString (#21).
+    if "type" in tag_keys and tag["type"] in ["multipolygon", "boundary"]:
+        force_linestring = False
+
+    # =========================================================
+    # Determine if element should be made as MultiPolygon
+    # Notice: If 'force_linestring = True', this doesn't apply
+    # =========================================================
+    make_multipolygon = False
+    if "type" in tag_keys:
+        if tag["type"] in ["multipolygon", "public_transport",
+                           "site", "cluster"]:
+            make_multipolygon = True
+    return force_linestring, make_multipolygon
+
+
+cpdef list relation_records(relations, relation_ways, node_coordinates,
+                            bint keep_metadata):
+    """The records of ``relations``, one relation at a time. A tag keyed ``id`` is kept
+    as ``id_tag``."""
+    cdef int i, j, n2, m_cnt
+    way_index = way_id_index(relation_ways["id"])
+    prepared_relations = []
+    for i in range(len(relations["id"])):
+        rel = filter_array_dict_by_indices_or_mask(relations, [i])
+        tag_keys = list(rel["tags"][0].keys())
+        tag = rel["tags"][0]
+
+        force_linestring, make_multipolygon = relation_kind(tag)
+
+        member_ids = rel["members"][0]["member_id"]
+        member_roles = rel["members"][0]["member_role"]
+
+        # Get ways for given relation
+        member_ids, member_roles, ways = get_ways_for_relation(member_ids,
+                                                               member_roles,
+                                                               relation_ways,
+                                                               way_index)
+
+        if ways is None:
+            continue
+
+        # Boundaries are dropped when their outer ways do not close (#154); other
+        # relation types keep the existing geometry handling.
+        geometry = create_relation_geometry(node_coordinates,
+                                            ways,
+                                            member_roles,
+                                            force_linestring,
+                                            make_multipolygon,
+                                            "boundary" in tag_keys
+                                            )
+        if geometry is None:
+            continue
+
+        # Check for multigeometries
+        if isinstance(geometry[0], list):
+            if len(geometry[0]) > 1:
+                if not force_linestring:
+                    geometry = multipolygons(geometry)
+                else:
+                    geometry = multilinestrings(geometry)
+        else:
+            geometry = geometry[0]
+
+        # Check if geometry is valid
+        is_valid_geom = is_valid(geometry)
+
+        # If geometry was invalid polygon try to fix
+        if not force_linestring:
+            if not is_valid_geom:
+                geometry = fix_geometry(geometry)
+
+        relation = dict(
+            id=rel["id"][0],
+            geometry=geometry
+        )
+        # Element metadata only when requested (otherwise these np.int32 values
+        # would be folded into the JSON 'tags' column and break serialization).
+        if keep_metadata:
+            relation["version"] = rel["version"][0]
+            relation["changeset"] = rel["changeset"][0]
+            relation["timestamp"] = rel["timestamp"][0]
+        # Like a way's, kept also without the metadata.
+        relation["visible"] = bool(rel["visible"][0])
+
+        # Add tags; one keyed "id" as "id_tag", so the relation keeps its id.
+        for k, v in rel["tags"][0].items():
+            relation["id_tag" if k == "id" else k] = v
+
+        # Add the relation members. Not listed in tags_to_keep, so it is folded
+        # into the JSON 'tags' column. Set after the tag loop so a stray tag
+        # named 'members' cannot shadow the structural member list.
+        relation["members"] = members_to_list(rel["members"][0])
+
+        prepared_relations.append(relation)
+
+    return prepared_relations
+
+cdef _prepare_relations(relations, relation_ways, node_coordinates, tags_to_keep, bint keep_metadata=True):
+    # Structural columns are always kept; element metadata only when requested.
+    tags_to_keep += ["id", "nodes"]
+    if keep_metadata:
+        tags_to_keep += ["timestamp", "changeset", "version"]
+    tags_to_keep += ["geometry"]
+
+    # Also geometries are parsed in this step
+    relation_records = get_relations(relations, relation_ways, node_coordinates, keep_metadata)
+
+    # Return empty frame if no relation records were successfully parsed
+    if len(relation_records) == 0:
+        return gpd.GeoDataFrame()
+
+    data = convert_way_records_to_lists(relation_records, tags_to_keep)
+    arrays = convert_to_arrays_and_drop_empty(data)
+    return arrays
+
+cpdef prepare_relations(relations, relation_ways, node_coordinates, tags_to_keep, bint keep_metadata=True):
+    return _prepare_relations(relations, relation_ways, node_coordinates, tags_to_keep, keep_metadata)

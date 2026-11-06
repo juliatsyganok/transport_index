@@ -1,0 +1,274 @@
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+from pyrosm._arrays cimport concatenate_dicts_of_arrays
+from pyrosm.geometry cimport _create_point_geometries
+from pyrosm.geometry cimport (
+    create_way_geometries, create_network_segments, segment_lines
+)
+from pyrosm.geometry import AREA_BY_TAGS, orient_polygons
+from pyrosm.relations import prepare_relations
+from shapely.geometry import box
+from pyrosm.data_filter import get_mask_by_osmid, _filter_array_dict_by_indices_or_mask
+from pyrosm.distance import calculate_line_lengths, segment_lengths
+from pyrosm.utils import warn_recorded
+from pyrosm.utils.progress import (
+    BUILDING_EDGES,
+    BUILDING_RELATIONS,
+    BUILDING_WAYS,
+    start_step,
+)
+
+cpdef create_nodes_gdf(nodes, osmids_to_keep=None):
+    cdef str k
+    if isinstance(nodes, list):
+        nodes = concatenate_dicts_of_arrays(nodes)
+
+    # Check if nodes should be filtered
+    if osmids_to_keep is not None:
+        if isinstance(osmids_to_keep, np.ndarray):
+            # Get mask for nodeid array
+            mask = get_mask_by_osmid(nodes["id"], osmids_to_keep)
+            nodes = _filter_array_dict_by_indices_or_mask(nodes, mask)
+        else:
+            raise ValueError("'indices_to_keep' should be a numpy array.")
+
+    geometry = _create_point_geometries(nodes['lon'], nodes['lat'])
+    return gpd.GeoDataFrame(dict(nodes), geometry=geometry, crs='epsg:4326')
+
+cpdef create_gdf(data_arrays, geometry_array):
+    return gpd.GeoDataFrame(
+        create_df(data_arrays), geometry=geometry_array, crs='epsg:4326'
+    )
+
+cpdef create_df(data_arrays):
+    cdef str key
+    # Build in one constructor call; per-column df[k]=... triggers a spurious
+    # pandas chained-assignment warning under Cython.
+    columns = {}
+    for key, data in data_arrays.items():
+        # 'nodes' must be a list of arrays to avoid a block-consolidation error
+        columns[key] = data.tolist() if key == "nodes" else data
+    return pd.DataFrame(columns)
+
+cpdef prepare_way_gdf(node_coordinates, ways, parse_network, calculate_seg_lengths):
+    """The GeoDataFrame of the way arrays ``ways`` and, for a graph export
+    (``parse_network`` and ``calculate_seg_lengths``), its segments' node rows and ids.
+    Whether each way's tags make it an area when closed (``AREA_BY_TAGS``) travels with
+    the ways, but is not one of their columns: it is taken out here."""
+    area_by_tags = ways.pop(AREA_BY_TAGS, None) if ways is not None else None
+    if ways is not None and parse_network and calculate_seg_lengths:
+        # Graph export: one row per segment, repeating its way's columns, and the
+        # attribute columns of the nodes the segments use
+        (ways, segment_counts, start, end, from_ids, to_ids, node_ids,
+         node_rows) = create_network_segments(node_coordinates, ways)
+        way_rows = np.repeat(np.arange(len(segment_counts)), segment_counts)
+        way_gdf = create_df(ways).iloc[way_rows].reset_index(drop=True)
+        way_gdf = way_gdf.assign(
+            osm_type="way", geometry=segment_lines(start, end), u=from_ids, v=to_ids
+        )
+        way_gdf = gpd.GeoDataFrame(way_gdf, geometry="geometry", crs="epsg:4326")
+        way_gdf = way_gdf.assign(length=segment_lengths(start, end))
+        return way_gdf, (node_rows, node_ids)
+
+    if ways is not None:
+        ways, geometries, _, _, _ = create_way_geometries(
+            node_coordinates, ways, parse_network, area_by_tags
+        )
+
+        # .assign (not df[col]=...) avoids the spurious Cython CoW warning
+        way_gdf = create_df(ways).assign(osm_type="way", geometry=geometries)
+
+        # In case network is parsed, include way-level length info
+        if parse_network and not calculate_seg_lengths:
+            # Drop rows without geometry; each remaining way is one LineString
+            way_gdf = way_gdf.dropna(subset=['geometry']).reset_index(drop=True)
+            way_gdf = way_gdf.assign(
+                length=calculate_line_lengths(way_gdf["geometry"].to_numpy())
+            )
+            way_gdf = gpd.GeoDataFrame(way_gdf, geometry="geometry", crs="epsg:4326")
+
+        # For cases not related to networks
+        else:
+            way_gdf = gpd.GeoDataFrame(way_gdf, geometry="geometry", crs="epsg:4326")
+
+    else:
+        way_gdf = gpd.GeoDataFrame()
+
+    return way_gdf, None
+
+cpdef network_node_frame(node_coordinates, rows, ids):
+    """The graph-export node frame of the nodes ``ids`` at ``rows`` of the coordinate
+    store ``node_coordinates``: their columns, ``id`` and Point geometries."""
+    node_attr = pd.DataFrame(dict(node_coordinates.columns_at(rows), id=ids))
+    return gpd.GeoDataFrame(
+        node_attr,
+        crs="epsg:4326",
+        geometry=gpd.points_from_xy(node_attr["lon"], node_attr["lat"]),
+    )
+
+cpdef prepare_node_gdf(nodes):
+    if nodes is not None:
+        # Create GeoDataFrame from nodes
+        node_gdf = create_nodes_gdf(nodes).assign(osm_type="node")
+    else:
+        node_gdf = gpd.GeoDataFrame()
+    return node_gdf
+
+cpdef prepare_relation_gdf(node_coordinates, relations, relation_ways, tags_as_columns, bint keep_metadata=True):
+    if relations is not None:
+        relations = prepare_relations(relations, relation_ways,
+                                      node_coordinates,
+                                      tags_as_columns,
+                                      keep_metadata)
+
+        # prepare_relations returns an empty GeoDataFrame when no relation could
+        # be assembled into a geometry (e.g. every boundary relation is incomplete
+        # and was dropped). It then has no geometry column, so building a
+        # GeoDataFrame(..., crs=...) from it would raise -- return empty instead.
+        if "geometry" not in relations:
+            relation_gdf = gpd.GeoDataFrame()
+        else:
+            relation_gdf = gpd.GeoDataFrame(relations, crs="epsg:4326").assign(
+                osm_type="relation"
+            )
+
+    else:
+        relation_gdf = gpd.GeoDataFrame()
+    return relation_gdf
+
+cdef int _count_straddling_relations(relations, relation_ways):
+    """Count filtered relations the bounding box cut: some member ways are present
+    (inside the box) and some are missing (outside it), so the assembled geometry is
+    incomplete. Used to warn when complete_relations was not requested."""
+    cdef int j, n_straddling = 0
+    if relations is None or relation_ways is None:
+        return 0
+    present = set(relation_ways["id"].tolist())
+    for members in relations["members"]:
+        member_ids = members["member_id"]
+        member_types = members["member_type"]
+        way_ids = set()
+        for j in range(len(member_ids)):
+            if member_types[j] == b"way":
+                way_ids.add(int(member_ids[j]))
+        n_present = len(way_ids & present)
+        if 0 < n_present < len(way_ids):
+            n_straddling += 1
+    return n_straddling
+
+
+cpdef prepare_geodataframe(nodes, node_coordinates, ways,
+                           relations, relation_ways,
+                           tags_as_columns, bounding_box,
+                           parse_network=False,
+                           calculate_seg_lengths=False,
+                           bint keep_metadata=True,
+                           bint complete_relations=False,
+                           steps=None):
+    """The GeoDataFrame of the nodes, ways and relations of a read (a network's edges,
+    and with them its nodes, with ``parse_network``), built in the steps
+    :data:`~pyrosm.utils.progress.BUILDING_WAYS` and
+    :data:`~pyrosm.utils.progress.BUILDING_RELATIONS` (a network's
+    :data:`~pyrosm.utils.progress.BUILDING_EDGES`) of ``steps`` (or None)."""
+
+    # Warn when a bounding-box read returned relations the box cut (some member ways
+    # fall outside the box, so the geometry is incomplete) and completion was not
+    # requested. Skipped for whole-file reads (which hold every member) and when
+    # complete_relations=True (the user already opted into fetching the full members).
+    if bounding_box is not None and not complete_relations:
+        n_straddling = _count_straddling_relations(relations, relation_ways)
+        if n_straddling > 0:
+            warn_recorded(
+                f"{n_straddling} relation(s) extend beyond the bounding box and were "
+                f"returned with incomplete geometry (some member ways fall outside "
+                f"the box). Pass complete_relations=True to OSM(...) to fetch their "
+                f"full member set.",
+                stacklevel=2,
+            )
+
+    # Prepare ways
+    start_step(steps, BUILDING_EDGES if parse_network else BUILDING_WAYS)
+    way_gdf, node_attr = prepare_way_gdf(node_coordinates,
+                                         ways,
+                                         parse_network,
+                                         calculate_seg_lengths)
+
+    # Prepare relation data
+    if not parse_network:
+        start_step(steps, BUILDING_RELATIONS)
+    relation_gdf = prepare_relation_gdf(node_coordinates, relations, relation_ways, tags_as_columns, keep_metadata)
+
+    # When not parsing the network,
+    # nodes should be kept as part of the main output
+    if not parse_network:
+        # Prepare nodes
+        node_gdf = prepare_node_gdf(nodes)
+    else:
+        node_gdf = gpd.GeoDataFrame()
+
+    # Merge all. A network has only ways, which prepare_way_gdf has already indexed and
+    # stripped of missing geometries.
+    if parse_network:
+        gdf = way_gdf
+    else:
+        gdf = pd.concat([node_gdf, way_gdf, relation_gdf])
+
+    if len(gdf) == 0:
+        if parse_network:
+            return None, None
+        return None
+
+    if not parse_network:
+        gdf = gdf.dropna(subset=['geometry']).reset_index(drop=True)
+
+    # Normalize polygon ring orientation to the OGC/GeoJSON right-hand rule
+    # (exterior CCW, holes CW); non-polygonal geometries are untouched (#230).
+    gdf["geometry"] = gpd.GeoSeries(
+        orient_polygons(gdf["geometry"].to_numpy()),
+        index=gdf.index,
+        crs=gdf.crs,
+    )
+
+    # When parsing the network with nodes, prepare the nodes frame
+    if node_attr is not None:
+        node_attr = network_node_frame(node_coordinates, *node_attr)
+        node_attr = node_attr.drop_duplicates("id").reset_index(drop=True)
+
+    # Filter by bounding box if it was used
+    if bounding_box is not None:
+        if isinstance(bounding_box, list):
+            bounding_box = box(*bounding_box)
+        # Filter data spatially
+        orig_cols = list(gdf.columns)
+        with_values = [
+            c for c in dict.fromkeys(tags_as_columns) if c in gdf and gdf[c].notna().any()
+        ]
+        filter_gdf = gpd.GeoDataFrame({"geometry": [bounding_box]},
+                                      crs="epsg:4326",
+                                      index=[0])
+        gdf = gpd.sjoin(gdf, filter_gdf, how="inner")
+        gdf = gdf[orig_cols].reset_index(drop=True)
+        # Leave out the tag columns that only rows outside the box had
+        gdf = gdf.drop(columns=[c for c in with_values if gdf[c].isna().all()])
+
+        if node_attr is not None:
+            # Keep every node referenced by the kept (whole) edges, including
+            # endpoints just outside the box. Spatially clipping the nodes to the
+            # box instead would drop boundary endpoints of edges that straddle the
+            # edge, leaving dangling u/v that break graph export (#199).
+            referenced = pd.unique(
+                np.concatenate([gdf["u"].to_numpy(), gdf["v"].to_numpy()])
+            )
+            node_attr = node_attr[node_attr["id"].isin(referenced)].reset_index(
+                drop=True
+            )
+
+    if len(gdf) == 0:
+        if parse_network:
+            return None, None
+        return None
+
+    if parse_network:
+        return gdf, node_attr
+    return gdf

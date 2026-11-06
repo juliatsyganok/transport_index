@@ -1,0 +1,15 @@
+{
+  "region": "south-fed-district",
+  "source": "data\\raw\\osm\\south-fed-district.osm.pbf",
+  "extractor": "pure-python-osm-pbf",
+  "created_utc": "2026-11-06T18:35:57.279665+00:00",
+  "ways": 651974,
+  "unique_node_ids_needed": 7078441,
+  "node_records_found": 7078441,
+  "possible_missing_nodes": 0,
+  "outputs": [
+    "ways.parquet",
+    "nodes.parquet"
+  ],
+  "note": "Candidate road ways; access/direction/topology filtering is next stage."
+}

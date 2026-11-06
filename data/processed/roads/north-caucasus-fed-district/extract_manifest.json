@@ -1,0 +1,15 @@
+{
+  "region": "north-caucasus-fed-district",
+  "source": "data\\raw\\osm\\north-caucasus-fed-district.osm.pbf",
+  "extractor": "pure-python-osm-pbf",
+  "created_utc": "2026-11-06T18:50:27.713328+00:00",
+  "ways": 238719,
+  "unique_node_ids_needed": 2234894,
+  "node_records_found": 2234894,
+  "possible_missing_nodes": 0,
+  "outputs": [
+    "ways.parquet",
+    "nodes.parquet"
+  ],
+  "note": "Candidate road ways; access/direction/topology filtering is next stage."
+}

@@ -1,0 +1,432 @@
+"""Geocode a place name and fetch the OSM data that covers it.
+
+Public entry points:
+
+- :func:`geocode` -- a place name, or a list of them, -> a Shapely polygon for the
+  place(s), via OpenStreetMap's Nominatim service.
+- :func:`get_data_by_geocoding` -- geocode a place (or places), then download (and by
+  default crop) the data for it as :func:`pyrosm.get_data_by_area` does.
+
+No extra dependencies: geocoding uses the stdlib ``urllib`` + ``json`` with the
+bundled ``certifi``, and ``shapely`` (already required) turns the response into a
+geometry. Geocoding uses Nominatim (https://nominatim.openstreetmap.org); its
+data is OpenStreetMap, licensed ODbL. Its usage policy
+(https://operations.osmfoundation.org/policies/nominatim/) allows at most one request
+per second from an application that identifies itself, asks for results to be cached
+and asks heavy users to run their own instance -- ``base_url`` lets you point at one.
+pyrosm keeps to it: it caches each answer for 7 days, sends the public server at most
+one request a second from a process, and starts no geocoding with pyrosm's own
+User-Agent, which every pyrosm user shares, once a process has sent 50 requests with it.
+"""
+
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import time
+import urllib.parse
+
+from shapely.geometry import box, shape
+from shapely.ops import unary_union
+
+from pyrosm._log import log_event
+from pyrosm.exceptions import RequestRefusedError
+from pyrosm.utils import download as _downloads
+from pyrosm.utils.download import _FETCH_ERRORS, _TIMEOUT, _retry, open_url
+
+logger = logging.getLogger(__name__)
+
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org"
+_POLICY_URL = "https://operations.osmfoundation.org/policies/nominatim/"
+# Seconds between two requests to the public server, how long an answer is kept, and how
+# many requests a process may send the public server with pyrosm's own User-Agent.
+_INTERVAL = 1.0
+_CACHE_SECONDS = 7 * 24 * 3600
+_SHARED_AGENT_LIMIT = 50
+# The longest place part of the name of a file cropped to several places.
+_MAX_SLUG = 80
+
+
+class _PublicServer:
+    """The requests this process sends the public Nominatim server: one at a time, at least
+    :data:`_INTERVAL` apart, and no geocoding started after :data:`_SHARED_AGENT_LIMIT`
+    requests with pyrosm's own User-Agent."""
+
+    def __init__(self):
+        # The turn lock is held through each request; the count lock only to count, so a
+        # refused geocoding never waits for a request in flight.
+        self.lock = threading.Lock()
+        self.count_lock = threading.Lock()
+        self.last = None
+        self.shared_agent_requests = 0
+
+    def reserve(self, own_agent):
+        """Count the first request of a geocoding with pyrosm's own User-Agent (unless
+        ``own_agent``, the caller's own), or raise
+        :class:`~pyrosm.exceptions.RequestRefusedError` when the process has sent the
+        public server :data:`_SHARED_AGENT_LIMIT` requests with it."""
+        if own_agent:
+            return
+        with self.count_lock:
+            sent = self.shared_agent_requests
+            if sent < _SHARED_AGENT_LIMIT:
+                self.shared_agent_requests += 1
+                return
+        raise RequestRefusedError(
+            "pyrosm has sent %d geocoding requests to the public Nominatim server from "
+            "this process with its own User-Agent, which every pyrosm user shares, and "
+            "sends no more. Nominatim's usage policy (%s) allows at most one request per "
+            "second from an application that identifies itself, and bans heavy users. "
+            "Pass your own user_agent (your application's name and a contact address), "
+            "or set base_url to your own Nominatim server for bulk geocoding."
+            % (sent, _POLICY_URL),
+            url=_NOMINATIM_URL,
+            attempts=0,
+        )
+
+    @contextlib.contextmanager
+    def turn(self, own_agent, retry):
+        """Hold the server while a request is sent and answered, once :data:`_INTERVAL`
+        has passed since the last one started; a ``retry`` with pyrosm's own User-Agent
+        (unless ``own_agent``) is counted, the first request being counted by
+        :meth:`reserve`."""
+        with self.lock:
+            if self.last is not None:
+                wait = self.last + _INTERVAL - time.monotonic()
+                if wait > 0:
+                    _downloads._sleep(wait)
+            if retry and not own_agent:
+                with self.count_lock:
+                    self.shared_agent_requests += 1
+            self.last = time.monotonic()
+            yield
+
+    def forget_lock(self):
+        """Give a forked child process locks of its own, as another thread of the parent
+        may have held these."""
+        self.lock = threading.Lock()
+        self.count_lock = threading.Lock()
+
+
+_PUBLIC = _PublicServer()
+with contextlib.suppress(AttributeError):  # os.register_at_fork is not on Windows
+    os.register_at_fork(after_in_child=lambda: _PUBLIC.forget_lock())
+
+
+def _cache_dir():
+    """The folder geocoding answers are cached in: ``geocoding`` in pyrosm's default
+    folder (see :func:`~pyrosm.utils.download.download_dir`)."""
+    return _downloads.download_dir() / "geocoding"
+
+
+def _cache_path(url, headers):
+    """The file that caches the answer to the request ``url`` with ``headers`` (pairs), all
+    but its User-Agent, which does not change the answer."""
+    sent = sorted((k.lower(), v) for k, v in headers if k.lower() != "user-agent")
+    key = json.dumps([url, sent]).encode("utf-8")
+    return _cache_dir() / ("%s.json" % hashlib.sha256(key).hexdigest())
+
+
+def _cached(url, headers):
+    """The cached answer to the request ``url`` with ``headers``, or None when there is
+    none younger than :data:`_CACHE_SECONDS` or it cannot be read."""
+    path = _cache_path(url, headers)
+    try:
+        if time.time() - path.stat().st_mtime < _CACHE_SECONDS:
+            return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cache(url, headers, results):
+    """Cache ``results``, the answer to the request ``url`` with ``headers``; a folder that
+    cannot be written leaves the answer uncached."""
+    data = json.dumps(results).encode("utf-8")
+    try:
+        _downloads.write_atomic(_cache_path(url, headers), lambda out: out.write(data))
+    except OSError:
+        pass
+
+
+def geocode(
+    query,
+    polygon=True,
+    base_url=_NOMINATIM_URL,
+    user_agent=None,
+    headers=None,
+    timeout=_TIMEOUT,
+    opener=None,
+):
+    """Geocode a place name, or several, to a Shapely polygon via Nominatim.
+
+    See https://pyrosm.readthedocs.io/en/stable/download_responsibly.html
+    for what the data providers ask and how pyrosm keeps to it.
+
+    Parameters
+    ----------
+    query : str | list of str
+        The place name to look up, e.g. ``"Brighton and Hove, UK"``, or a list of place
+        names, e.g. ``["Helsinki, Finland", "Espoo, Finland"]``, each looked up in turn and
+        their areas combined into one.
+
+    polygon : bool
+        When ``True`` (default), return the place's boundary polygon if Nominatim
+        provides one; otherwise (or for point-/line-like results such as POIs and
+        addresses) the place's bounding-box rectangle is returned. The result is
+        always a ``Polygon``/``MultiPolygon``.
+
+    base_url : str
+        The Nominatim base URL. Defaults to the public server; point it at your
+        own instance for heavy use.
+
+    user_agent : str, optional
+        The ``User-Agent`` header sent to Nominatim. Defaults to a pyrosm string (marked
+        ``agent`` when an AI coding agent runs pyrosm), which every pyrosm user shares:
+        once a process has sent the public server 50 requests with it, geocoding with it
+        raises :class:`~pyrosm.exceptions.RequestRefusedError`.
+        Nominatim rejects requests without a descriptive agent.
+
+    headers : dict, optional
+        Extra HTTP headers for the request; ``user_agent`` replaces a ``User-Agent`` in
+        them.
+
+    timeout : float | tuple
+        Seconds to wait for the server to accept the connection and then for each read
+        (60 by default), or a ``(connect, read)`` pair, as for downloads.
+
+    opener : object, optional
+        An object with ``open(request, timeout=...)``, e.g. from
+        ``urllib.request.build_opener()``, that makes the request instead of pyrosm.
+
+    Returns
+    -------
+    shapely.geometry.Polygon or shapely.geometry.MultiPolygon
+        The place's boundary polygon, or its bounding-box rectangle; for a list, the union
+        of the places' polygons (or rectangles).
+
+    Raises
+    ------
+    ValueError
+        If ``query`` is empty or not a place name or a list of them, the service cannot be
+        reached, or no match is found; the message names the place.
+    RequestRefusedError
+        If the process has sent the public server 50 requests with pyrosm's own User-Agent.
+
+    Notes
+    -----
+    Each answer is cached for 7 days in ``geocoding`` in pyrosm's default folder, so the
+    same query with the same headers (but for the User-Agent) is answered from there. The
+    public server gets at most one request a second from a process, as Nominatim's usage
+    policy asks (https://operations.osmfoundation.org/policies/nominatim/). Each name of a
+    list is a request of its own, cached, spaced and counted in the same way.
+    """
+    shapes = [
+        _geocode_place(name, polygon, base_url, user_agent, headers, timeout, opener)
+        for name in _place_names(query)
+    ]
+    return shapes[0] if len(shapes) == 1 else unary_union(shapes)
+
+
+def _place_names(query):
+    """The place names of ``query``, a place name or a list of them; ``ValueError`` when it
+    is neither, or a name is empty."""
+    names = list(query) if isinstance(query, (list, tuple)) else [query]
+    if not names or not all(isinstance(name, str) and name.strip() for name in names):
+        raise ValueError(
+            "'query' should be a non-empty place name or a list of non-empty place names."
+        )
+    return names
+
+
+def _geocode_place(query, polygon, base_url, user_agent, headers, timeout, opener):
+    """The polygon of one place name for :func:`geocode`, whose arguments these are."""
+    params = urllib.parse.urlencode(
+        {
+            "q": query,
+            "format": "jsonv2",
+            "limit": 1,
+            "polygon_geojson": 1 if polygon else 0,
+        }
+    )
+    url = "%s/search?%s" % (base_url.rstrip("/"), params)
+    headers = dict(headers or {})
+    if user_agent:
+        headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+        headers["User-Agent"] = user_agent
+
+    public = base_url.rstrip("/") == _NOMINATIM_URL
+    own_agent = any(k.lower() == "user-agent" for k in headers)
+    # A urllib opener's own headers, such as Accept-Language, may change the answer too;
+    # it sends them where the request has none of that name.
+    sent = {}
+    for k, v in getattr(opener, "addheaders", ()):
+        sent.setdefault(k.lower(), v)
+    sent.update((k.lower(), v) for k, v in headers.items())
+    sent = sent.items()
+    attempts = []
+
+    def fetch():
+        attempts.append(None)
+        with contextlib.ExitStack() as held:
+            if public:
+                held.enter_context(_PUBLIC.turn(own_agent, len(attempts) > 1))
+            with open_url(
+                url, headers=headers, timeout=timeout, opener=opener
+            ) as response:
+                return response.read()
+
+    results = _cached(url, sent)
+    if results is None:
+        if public:
+            _PUBLIC.reserve(own_agent)
+        try:
+            results = json.loads(_retry(fetch))
+        except _FETCH_ERRORS as e:
+            raise ValueError(
+                "Could not reach the geocoding service at %s to geocode '%s': %s"
+                % (base_url, query, e)
+            )
+        _cache(url, sent, results)
+
+    if not results:
+        raise ValueError("Could not geocode '%s'." % query)
+
+    result = results[0]
+    log_event(
+        logger,
+        logging.INFO,
+        "geocode",
+        query=query,
+        result=result.get("display_name", query),
+    )
+
+    geojson = result.get("geojson") if polygon else None
+    if geojson and geojson.get("type") in ("Polygon", "MultiPolygon"):
+        return shape(geojson)
+    south, north, west, east = (float(v) for v in result["boundingbox"])
+    return box(west, south, east, north)
+
+
+def _slug_filename(query):
+    """The name of the file cropped to the place ``query``: ``area_`` and the place in
+    lower case, so it never replaces a downloaded extract named after the place. For a list
+    of places, their names joined by ``_``; when that is longer than :data:`_MAX_SLUG`
+    characters, it is cut there and followed by a hash of the names."""
+    names = _place_names(query)
+    slug = "_".join(
+        re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "place" for name in names
+    )
+    if len(names) > 1 and len(slug) > _MAX_SLUG:
+        digest = hashlib.sha1(json.dumps(names).encode("utf-8")).hexdigest()[:8]
+        slug = "%s_%s" % (slug[:_MAX_SLUG].rstrip("-_"), digest)
+    return "area_%s.osm.pbf" % slug
+
+
+def get_data_by_geocoding(
+    query,
+    crop=True,
+    download=True,
+    update=False,
+    directory=None,
+    output_path=None,
+    base_url=_NOMINATIM_URL,
+    user_agent=None,
+    progress=None,
+    headers=None,
+    timeout=_TIMEOUT,
+    opener=None,
+    strategy="single",
+    must_cover=None,
+    workers=None,
+    tolerance=0.001,
+):
+    """Download (and by default crop) the OSM data for a geocoded place name, or several.
+
+    Geocodes ``query`` (:func:`geocode`) and gets the data for the place as
+    :func:`pyrosm.get_data_by_area` does: the smallest Geofabrik, BBBike or Movisda
+    extract (or set of extracts) that covers it, downloaded and -- by default -- cropped
+    to the place. For a list of place names, the places' areas are combined into one.
+
+    See https://pyrosm.readthedocs.io/en/stable/download_responsibly.html
+    for what the data providers ask and how pyrosm keeps to it.
+
+    Parameters
+    ----------
+    query : str | list of str
+        The place name to look up, e.g. ``"Brighton and Hove, UK"``, or a list of place
+        names, e.g. ``["Helsinki, Finland", "Espoo, Finland"]`` (see :func:`geocode`).
+
+    crop : bool
+        When ``True`` (default), crop the downloaded extract to the place (its boundary
+        polygon, or its box when the geocoder gives none) and return the cropped file,
+        named after the query (e.g. ``area_brighton-and-hove-uk.osm.pbf``, or
+        ``area_helsinki-finland_espoo-finland.osm.pbf`` for a list) and used again while
+        it and its extract are unchanged. When ``False``, return the full extract.
+
+    download : bool
+        When ``True`` (default), download the covering extract. When ``False``,
+        skip the download and return the PBF URL of the extract it would download
+        instead (a list of URLs for a set of extracts).
+
+    update, directory
+        As for :func:`pyrosm.get_data_by_area`.
+
+    output_path : str, optional
+        Path for the file pyrosm writes, as for :func:`pyrosm.get_data_by_area`.
+        Ignored when ``download=False``.
+
+    base_url : str
+        The Nominatim base URL (see :func:`geocode`).
+
+    user_agent : str, optional
+        The ``User-Agent`` header sent to Nominatim (see :func:`geocode`).
+
+    progress : bool | callable | None
+        ``None`` (default) follows :func:`pyrosm.enable_logging`, which is ``True`` unless
+        set. ``True`` shows the download as a bar on stderr, a widget in Jupyter when
+        ipywidgets is installed (``pip install "pyrosm[notebook]"``); without a terminal,
+        only a line naming the file is printed. ``False`` shows nothing. A callable is called
+        as ``progress(written, total)`` after each chunk, with the bytes written so far and
+        the file size, ``None`` when the server does not give it.
+        The crop shows its progress the same way; a callable is then called with the
+        percentage of the crop done.
+
+    headers, timeout, opener
+        Network options for the geocoding request and for the requests of
+        :func:`pyrosm.get_data_by_area`.
+
+    strategy, must_cover, workers, tolerance
+        As for :func:`pyrosm.get_data_by_area`.
+
+    Returns
+    -------
+    str | list
+        The cropped file path (default), the full extract path (``crop=False``), or
+        the covering extract's PBF URL (``download=False``; a list of URLs for a set of
+        extracts).
+    """
+    from pyrosm.data.extract_index import _get_area, _url_result
+
+    net = dict(headers=headers, timeout=timeout, opener=opener)
+    result = _get_area(
+        lambda: geocode(query, base_url=base_url, user_agent=user_agent, **net),
+        "polygon" if crop and not isinstance(crop, str) else crop,
+        update,
+        directory,
+        output_path,
+        headers,
+        timeout,
+        opener,
+        strategy,
+        must_cover,
+        workers,
+        progress,
+        name=_slug_filename(query),
+        download=download,
+        tolerance=tolerance,
+    )
+    return _url_result(result) if not download else result.path

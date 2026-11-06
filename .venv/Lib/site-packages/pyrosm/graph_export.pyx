@@ -1,0 +1,288 @@
+from pyrosm.utils._compat import HAS_IGRAPH, HAS_NETWORKX, HAS_PANDANA, HAS_PANDARM
+from pyrosm.config import Conf
+from collections import Counter
+from itertools import chain, compress
+from pyrosm.graph_simplify import _value_objects
+import geopandas as gpd
+import shapely
+import pandas as pd
+import numpy as np
+
+# The values used to determine oneway road in OSM
+oneway_values = Conf.oneway_values
+
+cpdef _count_streets_per_node(graph):
+    """
+    Counts the number of physical street segments incident to each node.
+
+    Returns a dictionary mapping node id -> street count. The result is the
+    OSMnx-compatible 'street_count' (number of undirected street segments
+    touching each intersection) and matches osmnx.stats.count_streets_per_node,
+    so that osmnx.basic_stats works on the exported graph.
+    """
+    import networkx as nx
+
+    undirected = graph.to_undirected(reciprocal=False, as_view=True)
+    self_loops = set(nx.selfloop_edges(undirected, keys=False))
+    non_self_loops = [e for e in undirected.edges(keys=False) if e not in self_loops]
+    counts = Counter(chain.from_iterable(non_self_loops + list(self_loops)))
+    return {node: counts[node] for node in graph.nodes()}
+
+cpdef _create_igraph(nodes,
+                     edges,
+                     from_id_col,
+                     to_id_col,
+                     node_id_col):
+    """
+    Creates a iGraph from directed edges and nodes. The vertices are the nodes in order,
+    with their columns as attributes and their position as ``node_id`` (unless a column
+    has that name); the edges carry their columns and the positions of their end nodes
+    as ``<from_id_col>_seq`` and ``<to_id_col>_seq``.
+    NOTE: Assumes that the input edges GeoDataFrame is directed and that its end nodes
+    are among the nodes.
+    """
+    if not HAS_IGRAPH:
+        raise ImportError("'python-igraph' needs to be installed "
+                          "in order to export the network for igraph.")
+    import igraph
+
+    nodes = nodes.reset_index(drop=True)
+    if "node_id" not in nodes.columns:
+        nodes["node_id"] = nodes.index
+    position = {node: i for i, node in enumerate(nodes[node_id_col].to_list())}
+    source = [position[node] for node in edges[from_id_col].to_list()]
+    target = [position[node] for node in edges[to_id_col].to_list()]
+    edge_attributes = edges.to_dict(orient="list")
+    edge_attributes[from_id_col + "_seq"] = source
+    edge_attributes[to_id_col + "_seq"] = target
+    return igraph.Graph(n=len(nodes), directed=True, edges=list(zip(source, target)),
+                        vertex_attrs=nodes.to_dict(orient="list"),
+                        edge_attrs=edge_attributes)
+
+cdef list _records(frame):
+    """The rows of ``frame`` as dicts of column name to value, with the columns where the
+    row has a value (not None or NaN), in column order. The values are those of
+    ``frame.to_dict(orient="records")``, with equal strings as one object."""
+    records = [{} for _ in range(len(frame))]
+    # A repeated column name takes the place of its first column and the values of its last.
+    last = {}
+    for i, name in enumerate(frame.columns.to_list()):
+        last[name] = i
+    for name, i in last.items():
+        column = frame.iloc[:, i]
+        present = column.notna().to_numpy()
+        values = _value_objects(column)[present].tolist()
+        for record, value in zip(compress(records, present), values):
+            record[name] = value
+    return records
+
+cpdef _create_nxgraph(nodes,
+                      edges,
+                      from_id_col,
+                      to_id_col,
+                      node_id_col,
+                      drop_node_id_attribute=False):
+    """
+    Creates a NetworkX graph from directed edges and nodes.
+    NOTE: Assumes that the input edges GeoDataFrame is directed and that its end nodes
+    are among the nodes.
+
+    With 'drop_node_id_attribute' the node id is used only as the key of the
+    node and is not repeated as a node attribute.
+    """
+    if not HAS_NETWORKX:
+        raise ImportError("'networkx' needs to be installed "
+                          "in order to export the network for networkx / osmnx.")
+    import networkx as nx
+
+    crs = f"EPSG:{edges.crs.to_epsg(min_confidence=25)}"
+
+    # Node attributes keyed by the node id (node_id_col), not the DataFrame
+    # index, so the nodes match the edge endpoints regardless of the index of
+    # the input frame (avoids duplicate "phantom" index-keyed nodes).
+    node_ids = nodes[node_id_col]
+    if drop_node_id_attribute:
+        node_records = _records(nodes.drop(columns=[node_id_col]))
+    else:
+        node_records = _records(nodes)
+    node_attributes = zip(node_ids.to_list(), node_records)
+
+    # Parallel edges between the same pair of nodes get the keys 0, 1, ... in their
+    # order, otherwise they would replace each other in the MultiDiGraph.
+    keys = edges.groupby([from_id_col, to_id_col], sort=False, dropna=False).cumcount()
+    edge_list = zip(edges[from_id_col].to_list(), edges[to_id_col].to_list(),
+                    keys.to_list(), _records(edges))
+
+    # Create directed graph
+    graph = nx.MultiDiGraph()
+    graph.add_nodes_from(node_attributes)
+    graph.add_edges_from(edge_list)
+    graph.graph["crs"] = crs
+    graph.graph["name"] = "Made with Pyrosm library."
+
+    # Add the OSMnx-compatible per-node 'street_count' attribute (number of
+    # physical street segments incident to each node) so that osmnx.basic_stats
+    # (and other functions reading it) work on the graph (#117).
+    nx.set_node_attributes(
+        graph, _count_streets_per_node(graph), name="street_count"
+    )
+
+    return graph
+
+cdef _build_routing_network(Network, nodes, edges, from_id_col, to_id_col, weight_cols,
+                            crs=None):
+    """
+    Builds a pandana/pandarm Network from directed edges and nodes, passing ``crs`` (the
+    CRS of the node coordinates, which only pandarm takes) when it is given.
+    NOTE: Assumes that the input edges GeoDataFrame is directed.
+    """
+    options = {} if crs is None else {"crs": crs}
+    return Network(node_x=nodes["x"],
+                   node_y=nodes["y"],
+                   edge_from=edges[from_id_col],
+                   edge_to=edges[to_id_col],
+                   edge_weights=edges[weight_cols],
+                   twoway=False,
+                   **options)
+
+
+cpdef _create_pdgraph(nodes,
+                      edges,
+                      from_id_col,
+                      to_id_col,
+                      weight_cols):
+    """
+    Creates a Pandana Network from directed edges and nodes.
+    """
+    if not HAS_PANDANA:
+        raise ImportError("'pandana' needs to be installed "
+                          "in order to export the network for it.")
+    from pandana import Network
+    return _build_routing_network(Network, nodes, edges, from_id_col, to_id_col, weight_cols)
+
+
+cpdef _create_pandarm_graph(nodes,
+                            edges,
+                            from_id_col,
+                            to_id_col,
+                            weight_cols):
+    """
+    Creates a pandarm Network from directed edges and nodes.
+    """
+    if not HAS_PANDARM:
+        raise ImportError("'pandarm' needs to be installed "
+                          "in order to export the network for it.")
+    from pandarm import Network
+    return _build_routing_network(Network, nodes, edges, from_id_col, to_id_col, weight_cols,
+                                  crs=getattr(nodes, "crs", None))
+
+
+cdef _oneway_masks(edges, direction, direction_suffix):
+    """Per edge, by position: whether it can be travelled in one direction only, and
+    whether that direction runs against its from -> to order ("-1" or "T").
+
+    A "<direction>:<direction_suffix>" column (e.g. "oneway:bicycle") overrides the base
+    direction where it is set, and a roundabout is one-way.
+    """
+    effective_direction = edges[direction]
+    if direction_suffix:
+        override_col = direction + ":" + direction_suffix
+        if override_col in edges.columns:
+            override = edges[override_col]
+            effective_direction = override.where(override.notna(), effective_direction)
+
+    if "junction" in edges.columns:
+        oneway_mask = (effective_direction.isin(oneway_values)) | (edges["junction"] == "roundabout")
+    else:
+        oneway_mask = effective_direction.isin(oneway_values)
+    return oneway_mask.to_numpy(), effective_direction.isin(["-1", "T"]).to_numpy()
+
+
+cpdef directed_rows(edges, direction, direction_suffix, force_bidirectional,
+                    way_of=None):
+    """The directed edges of `edges` as ``(rows, swapped)``, in the order
+    :func:`generate_directed_edges` gives them: directed edge ``i`` is row ``rows[i]`` of
+    `edges` (by position), travelled from its to-node to its from-node where
+    ``swapped[i]``. No column of `edges` is copied. With ``way_of``, `edges` are ways and
+    edge ``i`` is a segment of way row ``way_of[i]``, travelled as its way is."""
+    n = len(edges) if way_of is None else len(way_of)
+    if force_bidirectional:
+        rows = np.concatenate([np.arange(n), np.arange(n)])
+        return rows, np.repeat(np.array([False, True]), n)
+    oneway_mask, against_mask = _oneway_masks(edges, direction, direction_suffix)
+    if way_of is not None:
+        oneway_mask, against_mask = oneway_mask[way_of], against_mask[way_of]
+    along = np.flatnonzero(oneway_mask & ~against_mask)
+    against = np.flatnonzero(oneway_mask & against_mask)
+    twoway = np.flatnonzero(~oneway_mask)
+    rows = np.concatenate([along, against, twoway, twoway])
+    swapped = np.repeat(np.array([False, True, False, True]),
+                        [len(along), len(against), len(twoway), len(twoway)])
+    return rows, swapped
+
+
+cdef _with_lines_reversed(edges):
+    """``edges`` with the line of each row (its active geometry, when it has one)
+    reversed."""
+    if not isinstance(edges, gpd.GeoDataFrame) or edges._geometry_column_name not in edges:
+        return edges
+    name = edges.geometry.name
+    edges[name] = gpd.GeoSeries(
+        shapely.reverse(edges.geometry.values), index=edges.index, crs=edges.crs
+    )
+    return edges
+
+
+cpdef generate_directed_edges(edges,
+                              direction,
+                              direction_suffix,
+                              from_id_col,
+                              to_id_col,
+                              force_bidirectional):
+    """
+    Generates directed set of edges from network
+    following rules specified in 'direction' column.
+
+    If 'direction_suffix' is given, the "<direction>:<direction_suffix>" column
+    (e.g. "oneway:bicycle") overrides the base direction per edge wherever it is
+    set. This allows mode-specific exceptions such as contraflow cycling
+    (oneway=yes + oneway:bicycle=no -> two-way for bikes).
+
+    If 'force_bidirectional=True' travel to both direction is allowed for all edges.
+
+    An edge travelled against its way gets the way's line reversed, so every line runs
+    from the edge's from-node to its to-node.
+    """
+    if force_bidirectional:
+        # Flip from/to values
+        edges_dir2 = _with_lines_reversed(edges.copy(deep=True).rename(
+            columns={to_id_col: from_id_col,
+                     from_id_col: to_id_col}
+        ))
+        return pd.concat([edges, edges_dir2], ignore_index=True)
+
+    # ========================================
+    # Directed edges according 'oneway' rules
+    # ========================================
+
+    # The masks are applied positionally, as the index of the input frame may hold
+    # duplicate labels (e.g. after concatenating edge frames).
+    oneway_mask, against_mask = _oneway_masks(edges, direction, direction_suffix)
+
+    edge_cnt = len(edges)
+    twoway_edges = edges.loc[~oneway_mask].copy()
+    twoway_edges_dir2 = _with_lines_reversed(
+        twoway_edges.copy(deep=True).rename(columns={to_id_col: from_id_col, from_id_col: to_id_col})
+    )
+    twoway_edges_dir2.index = np.arange(edge_cnt, edge_cnt + len(twoway_edges))
+
+    against_edges = edges.loc[oneway_mask & against_mask].copy()
+    along_edges = edges.loc[oneway_mask & ~against_mask].copy()  # Nothing needs to be done for these
+
+    # Flip the from/to ids for against edges
+    against_edges = _with_lines_reversed(
+        against_edges.rename(columns={from_id_col: to_id_col, to_id_col: from_id_col})
+    )
+
+    # Stack everything (keep order)
+    return pd.concat([along_edges, against_edges, twoway_edges, twoway_edges_dir2])
